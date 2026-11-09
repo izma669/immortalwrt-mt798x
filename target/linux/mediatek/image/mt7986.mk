@@ -490,6 +490,21 @@ define Device/glinet_gl-mt6000
 endef
 TARGET_DEVICES += glinet_gl-mt6000
 
+define Device/clx_s20p
+   DEVICE_VENDOR := CLX
+   DEVICE_MODEL := S20P
+   DEVICE_DTS := mt7986a-clx-s20p
+   DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
+   SUPPORTED_DEVICES := clx,s20p
+   DEVICE_PACKAGES := kmod-mmc kmod-usb3 kmod-usb-storage kmod-usb-storage-uas \
+	kmod-fs-ext4 kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1 \
+	f2fsck mkf2fs losetup blockdev blkid
+   IMAGES += factory.bin
+   IMAGE/factory.bin := append-kernel | pad-to 32M | append-rootfs
+   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += clx_s20p
+
 define Device/ruijie-rg-x60-pro-stock
   DEVICE_VENDOR := Ruijie
   DEVICE_MODEL := Ruijie RG-X60 Pro (Stock)

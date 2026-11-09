@@ -155,6 +155,7 @@ platform_do_upgrade() {
 		nand_do_upgrade "$1"
 		;;
 	bananapi,bpi-r3mini-emmc |\
+	clx,s20p |\
 	glinet,gl-mt6000 |\
 	jdcloud,re-cp-03 |\
 	*emmc*)
@@ -182,6 +183,7 @@ platform_check_image() {
 	netcore,n60 |\
 	ruijie,rg-x60-pro* |\
 	*snand* |\
+	clx,s20p |\
 	glinet,gl-mt6000 |\
 	jdcloud,re-cp-03 |\
 	tplink,tl-xdr608* |\

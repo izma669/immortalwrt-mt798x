@@ -36,6 +36,9 @@ mediatek_setup_interfaces()
 	ruijie,rg-x60-pro*)
 		ucidef_set_interfaces_lan_wan "lan0 lan1 lan2 lan3" eth1
 		;;
+	clx,s20p)
+		ucidef_set_interfaces_lan_wan "lan6 lan5 lan4 lan3 lan2 lan1" eth1
+		;;
  	glinet,gl-mt6000)
  		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4 lan5" eth1
  		;;
@@ -67,6 +70,11 @@ mediatek_setup_macs()
 		wifi_mac=$(mtd_get_mac_binary $part_name 4)
 		lan_mac="$(macaddr_add $wifi_mac -1)"
 		wan_mac="$(macaddr_add $wifi_mac -2)"
+		;;
+	clx,s20p)
+		lan_mac=$(mmc_get_mac_binary factory 0x2a)
+		wan_mac=$(mmc_get_mac_binary factory 0x24)
+		label_mac=$lan_mac
 		;;
 	glinet,gl-mt6000)
  		label_mac=$(mmc_get_mac_binary factory 0x0a)

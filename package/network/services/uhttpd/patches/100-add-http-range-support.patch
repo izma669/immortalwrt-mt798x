@@ -1,0 +1,268 @@
+From: OpenWrt device support <openwrt@example.com>
+Subject: [PATCH] uhttpd: add HTTP Range request support
+
+Add single-range HTTP/1.1 Range handling to the static file handler.
+This allows video players and download tools to request partial content
+(206 Partial Content), and returns 416 for unsatisfiable ranges.
+
+Only one range is handled; multi-range requests fall back to a normal
+200 response. If-Range is honored by comparing the ETag or Last-Modified
+value, and a mismatch falls back to the full file.
+
+Signed-off-by: OpenWrt device support <openwrt@example.com>
+---
+--- a/uhttpd.h
++++ b/uhttpd.h
+@@ -23,6 +23,7 @@
+ #include <netinet/in.h>
+ #include <limits.h>
+ #include <dirent.h>
++#include <stdint.h>
+ 
+ #include <libubox/list.h>
+ #include <libubox/uloop.h>
+@@ -243,6 +244,7 @@
+ 		struct {
+ 			struct blob_attr **hdr;
+ 			int fd;
++			uint64_t length;
+ 		} file;
+ 		struct dispatch_proc proc;
+ #ifdef HAVE_UBUS
+--- a/file.c
++++ b/file.c
+@@ -31,6 +31,7 @@
+ #include <strings.h>
+ #include <dirent.h>
+ #include <inttypes.h>
++#include <stdlib.h>
+ 
+ #include <libubox/blobmsg.h>
+ 
+@@ -64,6 +65,7 @@
+ 	HDR_IF_MATCH,
+ 	HDR_IF_NONE_MATCH,
+ 	HDR_IF_RANGE,
++	HDR_RANGE,
+ 	__HDR_MAX
+ };
+ 
+@@ -442,16 +444,79 @@
+ 	return true;
+ }
+ 
+-static int uh_file_if_range(struct client *cl, struct stat *s)
+-{
++static bool uh_file_if_range(struct client *cl, struct stat *s)
++{
++	char buf[128];
+ 	char *hdr = uh_file_header(cl, HDR_IF_RANGE);
+ 
+-	if (hdr) {
+-		uh_file_response_412(cl);
+-		return false;
+-	}
+-
+-	return true;
++	if (!hdr)
++		return true;
++
++	if (!strcmp(hdr, uh_file_mktag(s, buf, sizeof(buf))))
++		return true;
++
++	if (uh_file_date2unix(hdr) == s->st_mtime)
++		return true;
++
++	return false;
++}
++
++static int uh_file_parse_range(const char *hdr, uint64_t total,
++			       uint64_t *start, uint64_t *end)
++{
++	const char *p;
++	char *ep;
++	uint64_t first, last;
++
++	if (!hdr || strncmp(hdr, "bytes=", 6))
++		return 0;
++
++	p = hdr + 6;
++	if (!*p || strchr(p, ','))
++		return 0;
++
++	if (!total)
++		return -1;
++
++	if (*p == '-') {
++		p++;
++		errno = 0;
++		first = strtoull(p, &ep, 10);
++		if (ep == p || *ep || errno || !first)
++			return -1;
++
++		if (first > total)
++			first = total;
++
++		*start = total - first;
++		*end = total - 1;
++		return 1;
++	}
++
++	errno = 0;
++	first = strtoull(p, &ep, 10);
++	if (ep == p || *ep != '-' || errno)
++		return -1;
++
++	p = ep + 1;
++	if (!*p) {
++		last = total - 1;
++	} else {
++		errno = 0;
++		last = strtoull(p, &ep, 10);
++		if (ep == p || *ep || errno)
++			return -1;
++
++		if (last >= total)
++			last = total - 1;
++	}
++
++	if (first >= total || first > last)
++		return -1;
++
++	*start = first;
++	*end = last;
++	return 1;
+ }
+ 
+ static int uh_file_if_unmodified_since(struct client *cl, struct stat *s)
+@@ -568,22 +633,36 @@
+ static void file_write_cb(struct client *cl)
+ {
+ 	int fd = cl->dispatch.file.fd;
++	uint64_t left = cl->dispatch.file.length;
++	size_t len;
+ 	int r;
+ 
+-	while (cl->us->w.data_bytes < 256) {
+-		r = read(fd, uh_buf, sizeof(uh_buf));
++	while (cl->us->w.data_bytes < 256 && left) {
++		len = sizeof(uh_buf);
++		if ((uint64_t)len > left)
++			len = left;
++
++		r = read(fd, uh_buf, len);
+ 		if (r < 0) {
+ 			if (errno == EINTR)
+ 				continue;
++
++			left = 0;
++			break;
+ 		}
+ 
+ 		if (!r) {
+-			uh_request_done(cl);
+-			return;
++			left = 0;
++			break;
+ 		}
+ 
+ 		uh_chunk_write(cl, uh_buf, r);
+-	}
++		left -= r;
++	}
++
++	cl->dispatch.file.length = left;
++	if (!left)
++		uh_request_done(cl);
+ }
+ 
+ static void uh_file_free(struct client *cl)
+@@ -593,11 +672,17 @@
+ 
+ static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
+ {
++	uint64_t total = pi->stat.st_size;
++	uint64_t start = 0, end = total ? total - 1 : 0;
++	uint64_t length = total;
++	bool if_range_ok = uh_file_if_range(cl, &pi->stat);
++	char *range_hdr;
++	int range = 0;
++
+ 	/* test preconditions */
+ 	if (!cl->dispatch.no_cache &&
+ 	    (!uh_file_if_modified_since(cl, &pi->stat) ||
+ 	     !uh_file_if_match(cl, &pi->stat) ||
+-	     !uh_file_if_range(cl, &pi->stat) ||
+ 	     !uh_file_if_unmodified_since(cl, &pi->stat) ||
+ 	     !uh_file_if_none_match(cl, &pi->stat))) {
+ 		ustream_printf(cl->us, "\r\n");
+@@ -606,15 +691,45 @@
+ 		return;
+ 	}
+ 
++	range_hdr = uh_file_header(cl, HDR_RANGE);
++	if (if_range_ok && range_hdr &&
++	    (cl->request.method == UH_HTTP_MSG_GET ||
++	     cl->request.method == UH_HTTP_MSG_HEAD)) {
++		int ret = uh_file_parse_range(range_hdr, total, &start, &end);
++
++		if (ret < 0) {
++			uh_http_header(cl, 416, "Range Not Satisfiable");
++			ustream_printf(cl->us, "Content-Range: bytes */%" PRIu64 "\r\n",
++				       total);
++			ustream_printf(cl->us, "Content-Length: 0\r\n\r\n");
++			uh_request_done(cl);
++			close(fd);
++			return;
++		}
++
++		if (ret > 0) {
++			range = 1;
++			length = end - start + 1;
++		}
++	}
++
+ 	/* write status */
+-	uh_file_response_200(cl, &pi->stat);
++	if (range) {
++		uh_http_header(cl, 206, "Partial Content");
++		uh_file_response_ok_hdrs(cl, &pi->stat);
++		ustream_printf(cl->us, "Accept-Ranges: bytes\r\n");
++		ustream_printf(cl->us,
++			       "Content-Range: bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64 "\r\n",
++			       start, end, total);
++	} else {
++		uh_file_response_200(cl, &pi->stat);
++		ustream_printf(cl->us, "Accept-Ranges: bytes\r\n");
++	}
+ 
+ 	ustream_printf(cl->us, "Content-Type: %s\r\n",
+ 			   uh_file_mime_lookup(pi->name));
+ 
+-	ustream_printf(cl->us, "Content-Length: %" PRIu64 "\r\n\r\n",
+-			   pi->stat.st_size);
+-
++	ustream_printf(cl->us, "Content-Length: %" PRIu64 "\r\n\r\n", length);
+ 
+ 	/* send body */
+ 	if (cl->request.method == UH_HTTP_MSG_HEAD) {
+@@ -623,7 +738,11 @@
+ 		return;
+ 	}
+ 
++	if (range)
++		lseek(fd, (off_t)start, SEEK_SET);
++
+ 	cl->dispatch.file.fd = fd;
++	cl->dispatch.file.length = length;
+ 	cl->dispatch.write_cb = file_write_cb;
+ 	cl->dispatch.free = uh_file_free;
+ 	cl->dispatch.close_fds = uh_file_free;
+@@ -839,6 +958,7 @@
+ 		[HDR_IF_MATCH] = { "if-match", BLOBMSG_TYPE_STRING },
+ 		[HDR_IF_NONE_MATCH] = { "if-none-match", BLOBMSG_TYPE_STRING },
+ 		[HDR_IF_RANGE] = { "if-range", BLOBMSG_TYPE_STRING },
++		[HDR_RANGE] = { "range", BLOBMSG_TYPE_STRING },
+ 	};
+ 	struct dispatch_handler *d;
+ 	struct blob_attr *tb[__HDR_MAX];
